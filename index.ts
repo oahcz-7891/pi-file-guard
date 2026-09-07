@@ -46,6 +46,10 @@ const DANGEROUS_BASH = [
 	/\b(dd|mkfs|fdisk|shred|wipefs)\b/i,
 	/\bgit\s+(push|reset|clean|checkout)\s+(-f|--hard|--force)/i,
 	/\bmv\b.+\b(dev|sys|proc)\b/i,
+	// New-file creation commands (also ask before creating a new file)
+	/\b(touch|mkdir|mktemp)\b/i,
+	/\bnew-item\b/i,
+	/\b(tee|printf|echo|cat)\b.+(>>|>)\s+\S+/i,
 ];
 
 interface State {
@@ -135,7 +139,7 @@ export default function (pi: ExtensionAPI) {
 		// "allow all" → skip the prompt
 		if (state.sessionAllowAll) return undefined;
 
-		const decision = await ask(title, ctx, state);
+		const decision = await ask(title, kind, ctx, state);
 		if (decision === "allow") return undefined;
 
 		if (decision === "unset") {
@@ -206,6 +210,7 @@ export default function (pi: ExtensionAPI) {
 
 async function ask(
 	title: string,
+	kind: "edit" | "write" | "bash",
 	ctx: ExtensionContext,
 	state: State,
 ): Promise<"allow" | "deny" | "deny-all" | "unset"> {
@@ -215,7 +220,10 @@ async function ask(
 	}
 	if (state.sessionAllowAll) return "allow";
 
-	const prompt = `${stylePrompt(title, ctx.ui.theme)}\n\n${ctx.ui.theme.fg("warning", ctx.ui.theme.bold("Allow this operation?"))}`;
+	// Manual bold: theme.bold() uses chalk, which is level-0 inside pi's
+	// extension runtime (no TTY), so bold styles never render.
+	const warn = (s: string) => ctx.ui.theme.fg("warning", `\x1b[1m${s}\x1b[22m`);
+	const prompt = `${stylePrompt(title, ctx.ui.theme, kind)}\n\n${warn("Allow this operation?")}`;
 	const choice: Decision = await ctx.ui.select(prompt, [...MENU]);
 
 	switch (choice) {
@@ -236,22 +244,29 @@ async function ask(
 // ---------- prompt styling (static ANSI colors, no animation) ----------
 
 /**
- * Style C: title line in warning yellow bold, diff lines in their own
- * colors, everything else in the normal text color. The resulting string
- * carries inline ANSI codes, which override the select dialog's built-in
- * accent styling; it renders only in the terminal and never reaches the LLM.
+ * Style II (subtle): warning-yellow bold title/question lines, muted gray
+ * meta/preview lines; edit diffs keep the theme's red/green. Coloring is
+ * per tool kind so previews can't be misdetected by "- " / "+ " prefixes.
+ * The string carries inline ANSI codes, overrides the select dialog's built-in
+ * accent styling, renders only in the terminal, and never reaches the LLM.
  */
-function stylePrompt(title: string, theme: Theme): string {
-	const warn = (s: string) => theme.fg("warning", theme.bold(s));
+function stylePrompt(title: string, theme: Theme, kind: "edit" | "write" | "bash"): string {
+	const warn = (s: string) => theme.fg("warning", `\x1b[1m${s}\x1b[22m`);
+	const muted = (s: string) => theme.fg("muted", s);
 	return title
 		.split("\n")
 		.map((line, i) => {
 			if (!line) return line;
 			if (i === 0) return warn(line);
-			if (line.startsWith("  - ")) return theme.fg("toolDiffRemoved", line);
-			if (line.startsWith("  + ")) return theme.fg("toolDiffAdded", line);
-			if (line.startsWith("  ...") || line.startsWith("  ---")) return theme.fg("muted", line);
-			return theme.fg("text", line);
+			if (kind === "edit") {
+				if (line.startsWith("  - ")) return theme.fg("toolDiffRemoved", line);
+				if (line.startsWith("  + ")) return theme.fg("toolDiffAdded", line);
+				return muted(line);
+			}
+			// bash: highlight the whole command line in warning yellow
+			if (kind === "bash") return warn(line);
+			// write: quiet muted content preview
+			return muted(line);
 		})
 		.join("\n");
 }
