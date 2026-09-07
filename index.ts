@@ -23,7 +23,7 @@
  *     blocked by default (fail-safe).
  */
 
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import { isToolCallEventType } from "@earendil-works/pi-coding-agent";
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
@@ -99,7 +99,7 @@ export default function (pi: ExtensionAPI) {
 			const abs = resolve(ctx.cwd, path ?? "");
 			const blocks = (edits ?? []).map((e) => diffBlock(e.oldText ?? "", e.newText ?? ""));
 			title = [
-				`Permission required - edit file ${path}`,
+				`PERMISSION REQUIRED - edit file ${path}`,
 				existsSync(abs)
 					? `(overwrite existing file, ${blocks.length} change${blocks.length === 1 ? "" : "s"})`
 					: "(file does not exist, will be created)",
@@ -112,7 +112,7 @@ export default function (pi: ExtensionAPI) {
 			const abs = resolve(ctx.cwd, path ?? "");
 			const contentLines = (content ?? "").split("\n").length;
 			title = [
-				`Permission required - write file ${path}`,
+				`PERMISSION REQUIRED - write file ${path}`,
 				existsSync(abs)
 					? `(overwrite existing file, ${contentLines} lines)`
 					: `(new file, ${contentLines} lines)`,
@@ -123,7 +123,7 @@ export default function (pi: ExtensionAPI) {
 			const command = event.input.command ?? "";
 			if (!DANGEROUS_BASH.some((p) => p.test(command))) return undefined;
 			kind = "bash";
-			title = ["Permission required - dangerous command", "", capLines(command, 20, 40)].join("\n");
+			title = ["PERMISSION REQUIRED - DANGEROUS COMMAND", "", capLines(command, 20, 40)].join("\n");
 		}
 
 		if (!kind || !title) return undefined;
@@ -215,7 +215,8 @@ async function ask(
 	}
 	if (state.sessionAllowAll) return "allow";
 
-	const choice: Decision = await ctx.ui.select(`${title}\n\nAllow this operation?`, [...MENU]);
+	const prompt = `${stylePrompt(title, ctx.ui.theme)}\n\n${ctx.ui.theme.fg("warning", ctx.ui.theme.bold("Allow this operation?"))}`;
+	const choice: Decision = await ctx.ui.select(prompt, [...MENU]);
 
 	switch (choice) {
 		case "Allow this one":
@@ -230,6 +231,29 @@ async function ask(
 		default: // Escape
 			return "unset";
 	}
+}
+
+// ---------- prompt styling (static ANSI colors, no animation) ----------
+
+/**
+ * Style C: title line in warning yellow bold, diff lines in their own
+ * colors, everything else in the normal text color. The resulting string
+ * carries inline ANSI codes, which override the select dialog's built-in
+ * accent styling; it renders only in the terminal and never reaches the LLM.
+ */
+function stylePrompt(title: string, theme: Theme): string {
+	const warn = (s: string) => theme.fg("warning", theme.bold(s));
+	return title
+		.split("\n")
+		.map((line, i) => {
+			if (!line) return line;
+			if (i === 0) return warn(line);
+			if (line.startsWith("  - ")) return theme.fg("toolDiffRemoved", line);
+			if (line.startsWith("  + ")) return theme.fg("toolDiffAdded", line);
+			if (line.startsWith("  ...") || line.startsWith("  ---")) return theme.fg("muted", line);
+			return theme.fg("text", line);
+		})
+		.join("\n");
 }
 
 // ---------- preview helpers ----------
