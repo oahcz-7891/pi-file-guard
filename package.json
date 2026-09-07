@@ -1,0 +1,12 @@
+{
+  "name": "pi-file-guard",
+  "version": "1.0.0",
+  "description": "Approve file modifications (edit/write/dangerous bash) before they happen, with arrow-key select dialogs.",
+  "keywords": ["pi-package"],
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "pi": {
+    "extensions": ["./index.ts"]
+  }
+}
