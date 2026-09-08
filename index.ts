@@ -52,6 +52,13 @@ const DANGEROUS_BASH = [
 	/\b(tee|printf|echo|cat)\b.+(>>|>)\s+\S+/i,
 ];
 
+// 安静配色 (calm) —— 硬编码 ANSI 24-bit 真彩色，强制朴素色，不随终端主题变化。
+// 只在“鲜艳”的语义色上用固定值；灰(muted)仍沿用终端主题。
+const C_WARN  = "\x1b[1;38;2;198;163;90m";  // 警告黄 #c6a35a（含粗体）
+const C_DEL   = "\x1b[38;2;194;112;111m";    // 危险操作 / edit 删行 红 #c2706f
+const C_ADD   = "\x1b[38;2;130;170;123m";    // 新增(写入) 绿 #82aa7b
+const C_RESET = "\x1b[0m";
+
 interface State {
 	enabled: boolean;
 	gateEdit: boolean;
@@ -222,7 +229,7 @@ async function ask(
 
 	// Manual bold: theme.bold() uses chalk, which is level-0 inside pi's
 	// extension runtime (no TTY), so bold styles never render.
-	const warn = (s: string) => ctx.ui.theme.fg("warning", `\x1b[1m${s}\x1b[22m`);
+	const warn = (s: string) => `${C_WARN}${s}${C_RESET}`;
 	const prompt = `${stylePrompt(title, ctx.ui.theme, kind)}\n\n${warn("Allow this operation?")}`;
 	const choice: Decision = await ctx.ui.select(prompt, [...MENU]);
 
@@ -244,23 +251,25 @@ async function ask(
 // ---------- prompt styling (static ANSI colors, no animation) ----------
 
 /**
- * Style II (subtle): warning-yellow bold title/question lines, muted gray
- * meta/preview lines; edit diffs keep the theme's red/green. Coloring is
- * per tool kind so previews can't be misdetected by "- " / "+ " prefixes.
- * The string carries inline ANSI codes, overrides the select dialog's built-in
- * accent styling, renders only in the terminal, and never reaches the LLM.
+ * 安静配色 (calm)：标题/问题行、write 内容预览、bash 危险命令用固定 ANSI 色
+ * （黄 #c6a35a / 绿 #82aa7b），edit 差异行用红 #c2706f 绿 #82aa7b；
+ * meta 及 diff 上下文仍沿用主题 muted 灰。着色按 tool 类型判断，避免被
+ * "- " / "+ " 前缀误判。字符串带内联 ANSI 码，覆盖 select 弹窗自带 accent，
+ * 只在终端渲染，不进入 LLM。
  */
 function stylePrompt(title: string, theme: Theme, kind: "edit" | "write" | "bash"): string {
-	const warn = (s: string) => theme.fg("warning", `\x1b[1m${s}\x1b[22m`);
+	const warn = (s: string) => `${C_WARN}${s}${C_RESET}`;
 	const muted = (s: string) => theme.fg("muted", s);
+	const diffRemoved = (s: string) => `${C_DEL}${s}${C_RESET}`;
+	const diffAdded = (s: string) => `${C_ADD}${s}${C_RESET}`;
 	return title
 		.split("\n")
 		.map((line, i) => {
 			if (!line) return line;
 			if (i === 0) return warn(line);
 			if (kind === "edit") {
-				if (line.startsWith("  - ")) return theme.fg("toolDiffRemoved", line);
-				if (line.startsWith("  + ")) return theme.fg("toolDiffAdded", line);
+				if (line.startsWith("  - ")) return diffRemoved(line);
+				if (line.startsWith("  + ")) return diffAdded(line);
 				return muted(line);
 			}
 			// bash: highlight the whole command line in warning yellow
