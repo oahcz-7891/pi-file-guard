@@ -371,16 +371,17 @@ export default function (pi: ExtensionAPI) {
 /** Classify an edit/write target. Sensitive / outside-project paths escalate. */
 function classifyPath(kind: Kind, path: string, abs: string, cwd: string, content = ""): Verdict {
 	const exists = existsSync(abs);
-	let tier: Tier;
+	// edit and write share the same base tier: overwriting a file is no more
+	// dangerous than editing it. In-project writes are therefore not gated at
+	// L2; only the sensitive-path / outside-project escalations below still
+	// raise them above the level.
+	let tier: Tier = 3;
 	let label: string;
 	if (kind === "edit") {
-		tier = 3;
 		label = exists ? "edit file" : "edit creates file";
 	} else if (exists) {
-		tier = 2;
 		label = "overwrite existing file";
 	} else {
-		tier = 3;
 		label = "create new file";
 	}
 	const base = tier;
