@@ -21,7 +21,7 @@
 | 3 high | + 全部 edit / write / 文件创建 |
 | 4 paranoid | + 所有工具调用 |
 
-敏感路径（`.env`、`.git/`、`.ssh/`、`package.json`、lockfile、CI 配置）与项目外路径会升一档。
+敏感路径（`.env`、`.git/`、`.ssh/`、`package.json`、lockfile、CI 配置）会升一档；**当前文件夹外**的路径再升一档（比项目内同类操作更危险）。
 
 ### 命令
 
@@ -37,6 +37,7 @@
 ### 说明
 
 - 非交互模式（`pi -p`、`--mode json`）无法弹窗，修改类操作默认拦截（fail-safe）。
+- **项目内 / 项目外分开记忆**：选「Yes, and allow all … this session」只对当前范围生效；允许项目内改动不会顺带放行项目外改动。
 - 等级按会话保存，`/reload` 与切分支不丢；项目默认值写在 `.pi/pi-file-guard.json`：`{ "level": 2 }`。
 - 不增加模型 token 消耗。
 

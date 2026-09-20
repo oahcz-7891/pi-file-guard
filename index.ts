@@ -12,6 +12,9 @@
  *     `tier <= level`. Level 0 disables gating, level 2 (default) gates
  *     catastrophic + destructive bash, level 3 gates all edit/write plus
  *     dangerous bash, level 4 gates every tool call.
+ *   - Paths outside ctx.cwd are one tier more dangerous than the same
+ *     operation in-project, and keep their own session allow/deny memory
+ *     ("allow all in-project" never whitelists out-of-project edits).
  *
  * The prompt body mimics Claude Code's permission UI:
  *   ● Update(path)          (green dot, bold tool name)
@@ -79,6 +82,8 @@ type Kind = "edit" | "write" | "bash" | "other";
 type Decision = "allow" | "deny" | "deny-all" | "unset";
 type Level = 0 | 1 | 2 | 3 | 4;
 type Tier = 1 | 2 | 3 | 4;
+/** Whether a target lives inside ctx.cwd. Each scope keeps its own memory. */
+type Scope = "inside" | "outside";
 
 /** A classified tool call: how dangerous it is and why. */
 interface Verdict {
@@ -86,6 +91,7 @@ interface Verdict {
 	label: string;
 	reasons?: string[];
 	note?: string;
+	scope?: Scope;
 }
 
 const LEVELS: { name: string; scope: string }[] = [
@@ -164,9 +170,10 @@ interface State {
 	mutedEdit: boolean; // "mute" means: never gate this tool, whatever the level
 	mutedWrite: boolean;
 	mutedBash: boolean;
-	// Session-level memory, reset on session_start and on level change
-	sessionAllowAll: boolean;
-	sessionBlockAll: boolean;
+	// Session-level memory, kept separate for inside vs outside ctx.cwd so
+	// "allow all in-project" never silently whitelists out-of-project edits.
+	allowAll: Record<Scope, boolean>;
+	blockAll: Record<Scope, boolean>;
 }
 
 export default function (pi: ExtensionAPI) {
@@ -176,8 +183,8 @@ export default function (pi: ExtensionAPI) {
 		mutedEdit: false,
 		mutedWrite: false,
 		mutedBash: false,
-		sessionAllowAll: false,
-		sessionBlockAll: false,
+		allowAll: { inside: false, outside: false },
+		blockAll: { inside: false, outside: false },
 	};
 
 	function persist() {
@@ -193,8 +200,8 @@ export default function (pi: ExtensionAPI) {
 	function setLevel(next: Level) {
 		if (next === state.level) return;
 		// Do not carry "allow all" from a looser level into a stricter one.
-		state.sessionAllowAll = false;
-		state.sessionBlockAll = false;
+		state.allowAll = { inside: false, outside: false };
+		state.blockAll = { inside: false, outside: false };
 		if (next > 0) state.lastNonZeroLevel = next;
 		state.level = next;
 		persist();
@@ -217,12 +224,14 @@ export default function (pi: ExtensionAPI) {
 			state.level = readProjectDefault(ctx.cwd) ?? 2;
 			state.lastNonZeroLevel = state.level || 2;
 		}
-		state.sessionAllowAll = false;
-		state.sessionBlockAll = false;
+		state.allowAll = { inside: false, outside: false };
+		state.blockAll = { inside: false, outside: false };
 	}
 
 	function updateStatus(ctx: ExtensionContext) {
-		const extra = state.sessionBlockAll ? " [blocked]" : state.sessionAllowAll ? " [allowed]" : "";
+		const blocked = state.blockAll.inside || state.blockAll.outside;
+		const allowed = state.allowAll.inside || state.allowAll.outside;
+		const extra = blocked ? " [blocked]" : allowed ? " [allowed]" : "";
 		ctx.ui.setStatus(STATUS_ID, `guard: L${state.level} ${LEVELS[state.level].name}${extra}`);
 	}
 
@@ -263,14 +272,16 @@ export default function (pi: ExtensionAPI) {
 
 		if (!kind || !verdict || !prompt) return undefined;
 
-		// Session memory first: "deny all" → silently block
-		if (state.sessionBlockAll) {
+		const scope = scopeOf(verdict);
+
+		// Session memory first (per scope): "deny all" → silently block
+		if (state.blockAll[scope]) {
 			return { block: true, reason: "User denied all changes for this session" };
 		}
 		// "allow all" → skip the prompt
-		if (state.sessionAllowAll) return undefined;
+		if (state.allowAll[scope]) return undefined;
 
-		const decision = await ask(prompt, kind, ctx, state);
+		const decision = await ask(prompt, kind, scope, ctx, state);
 		if (decision === "allow") return undefined;
 
 		if (decision === "unset") {
@@ -281,7 +292,7 @@ export default function (pi: ExtensionAPI) {
 			return { block: true, reason: "Denied by user" };
 		}
 		// deny-all
-		state.sessionBlockAll = true;
+		state.blockAll[scope] = true;
 		ctx.ui.notify("Denied - pi will not ask again this session", "warning");
 		updateStatus(ctx);
 		return { block: true, reason: "Denied by user (this session)" };
@@ -345,8 +356,8 @@ export default function (pi: ExtensionAPI) {
 				state.mutedBash = !state.mutedBash;
 				persist();
 			} else if (arg === "reset") {
-				state.sessionAllowAll = false;
-				state.sessionBlockAll = false;
+				state.allowAll = { inside: false, outside: false };
+				state.blockAll = { inside: false, outside: false };
 			}
 
 			updateStatus(ctx);
@@ -382,13 +393,21 @@ function classifyPath(kind: Kind, path: string, abs: string, cwd: string, conten
 			break;
 		}
 	}
-	if (!isInside(cwd, abs)) {
+	const inside = isInside(cwd, abs);
+	if (!inside) {
+		// Outside the project root is one tier more dangerous than the same
+		// operation in-project (tier 1 is the most dangerous).
 		reasons.push("outside project");
 		if (tier > 1) tier = (tier - 1) as Tier;
 	}
 	if (kind === "write" && content.split("\n").length > 200) reasons.push("large write");
 	const note = tier < base ? `escalated from tier ${base}` : undefined;
-	return { tier, label, reasons: reasons.length ? reasons : undefined, note };
+	return { tier, label, reasons: reasons.length ? reasons : undefined, note, scope: inside ? "inside" : "outside" };
+}
+
+/** Bash and non-file tools belong to the in-project scope. */
+function scopeOf(v: Verdict): Scope {
+	return v.scope ?? "inside";
 }
 
 /** Classify a bash command; compound commands take the most dangerous segment. */
@@ -445,20 +464,22 @@ function readProjectDefault(cwd: string): Level | undefined {
 // ---------- confirmation menu ----------
 
 /** Claude Code style wording; the option at each index maps to a decision. */
-function menuFor(kind: Kind): string[] {
+function menuFor(kind: Kind, scope: Scope): string[] {
 	const noun =
 		kind === "edit" ? "edits" : kind === "write" ? "writes" : kind === "bash" ? "bash commands" : "tool calls";
+	const where = scope === "outside" ? "outside this project" : "in this project";
 	return [
 		"Yes",
-		`Yes, and allow all ${noun} this session`,
+		`Yes, and allow all ${noun} ${where} this session`,
 		"No",
-		"No, and stop asking this session",
+		`No, and stop asking for ${noun} ${where} this session`,
 	];
 }
 
 async function ask(
 	prompt: string,
 	kind: Kind,
+	scope: Scope,
 	ctx: ExtensionContext,
 	state: State,
 ): Promise<Decision> {
@@ -466,9 +487,8 @@ async function ask(
 		// No UI (-p / json mode) - cannot prompt, fail-safe deny
 		return "unset";
 	}
-	if (state.sessionAllowAll) return "allow";
 
-	const options = menuFor(kind);
+	const options = menuFor(kind, scope);
 	const choice = await ctx.ui.select(prompt, options);
 	const index = choice === undefined ? -1 : options.indexOf(choice);
 
@@ -476,7 +496,7 @@ async function ask(
 		case 0:
 			return "allow";
 		case 1:
-			state.sessionAllowAll = true;
+			state.allowAll[scope] = true;
 			return "allow";
 		case 2:
 			return "deny";
@@ -506,8 +526,12 @@ function statusText(state: State): string {
 		`Danger level: ${state.level} (${l.name})${state.level === 0 ? " · off" : ` — gates tier ≤ ${state.level}`}`,
 		`  scope: ${l.scope}`,
 		`  muted tools: ${mutes.length ? mutes.join(", ") : "none"}`,
-		`  session memory: ${state.sessionBlockAll ? "deny all" : state.sessionAllowAll ? "allow all" : "none"}`,
+		`  session memory: in-project ${memory(state, "inside")} · outside ${memory(state, "outside")}`,
 	].join("\n");
+}
+
+function memory(state: State, scope: Scope): string {
+	return state.blockAll[scope] ? "deny all" : state.allowAll[scope] ? "allow all" : "none";
 }
 
 // ---------- Claude-style prompt builders ----------
