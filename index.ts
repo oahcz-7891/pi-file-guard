@@ -18,7 +18,7 @@
  *
  * The prompt body mimics Claude Code's permission UI:
  *   ● Update(path)          (green dot, bold tool name)
- *     ⚠ tier 2 · sensitive path · escalated from tier 3
+ *     Overwrite .env (12 lines) · .env · outside project
  *     ⎿  Removed 1 line      (summary)
  *        11 - old line       (red background)
  *        11 + new line       (green background)
@@ -90,7 +90,6 @@ interface Verdict {
 	tier: Tier;
 	label: string;
 	reasons?: string[];
-	note?: string;
 	scope?: Scope;
 }
 
@@ -103,12 +102,6 @@ const LEVELS: { name: string; scope: string }[] = [
 ];
 
 const TIER_COLOR: Record<Tier, string> = { 1: S_T1, 2: S_T2, 3: S_T3, 4: S_DIM };
-const TIER_NOTE: Record<Tier, string> = {
-	1: "catastrophic & irreversible",
-	2: "destructive",
-	3: "modifies files",
-	4: "read-only",
-};
 
 const clampLevel = (n: number): Level => Math.max(0, Math.min(4, Math.round(n))) as Level;
 
@@ -249,13 +242,13 @@ export default function (pi: ExtensionAPI) {
 			const { path, edits } = event.input;
 			const abs = resolve(ctx.cwd, path ?? "");
 			verdict = classifyPath("edit", path ?? "", abs, ctx.cwd);
-			if (verdict.tier <= state.level) prompt = buildEditPrompt(path ?? "", edits ?? [], abs, verdict);
+			if (verdict.tier <= state.level) prompt = buildEditPrompt(path ?? "", edits ?? [], abs, ctx.cwd, verdict);
 		} else if (!state.mutedWrite && isToolCallEventType("write", event)) {
 			kind = "write";
 			const { path, content } = event.input;
 			const abs = resolve(ctx.cwd, path ?? "");
 			verdict = classifyPath("write", path ?? "", abs, ctx.cwd, content ?? "");
-			if (verdict.tier <= state.level) prompt = buildWritePrompt(path ?? "", content ?? "", abs, verdict);
+			if (verdict.tier <= state.level) prompt = buildWritePrompt(path ?? "", content ?? "", abs, ctx.cwd, verdict);
 		} else if (!state.mutedBash && isToolCallEventType("bash", event)) {
 			const command = event.input.command ?? "";
 			verdict = classifyBash(command);
@@ -384,7 +377,6 @@ function classifyPath(kind: Kind, path: string, abs: string, cwd: string, conten
 	} else {
 		label = "create new file";
 	}
-	const base = tier;
 	const reasons: string[] = [];
 	const norm = path.replace(/\\/g, "/");
 	for (const sp of SENSITIVE_PATHS) {
@@ -402,8 +394,7 @@ function classifyPath(kind: Kind, path: string, abs: string, cwd: string, conten
 		if (tier > 1) tier = (tier - 1) as Tier;
 	}
 	if (kind === "write" && content.split("\n").length > 200) reasons.push("large write");
-	const note = tier < base ? `escalated from tier ${base}` : undefined;
-	return { tier, label, reasons: reasons.length ? reasons : undefined, note, scope: inside ? "inside" : "outside" };
+	return { tier, label, reasons: reasons.length ? reasons : undefined, scope: inside ? "inside" : "outside" };
 }
 
 /** Bash and non-file tools belong to the in-project scope. */
@@ -553,19 +544,119 @@ function summarize(removed: number, added: number): string {
 	return parts.length ? parts.join(", ") : "No changes";
 }
 
-/** One-line danger banner: `⚠ tier 2 · recursive delete · destructive`. */
-function dangerLine(v: Verdict): string {
-	const color = TIER_COLOR[v.tier];
-	const ico = v.tier === 4 ? "·" : "⚠";
-	const main = [`${ico} tier ${v.tier}`, v.label, ...(v.reasons ?? [])].join(" · ");
-	return paint(color, main) + paint(S_DIM, ` · ${v.note ?? TIER_NOTE[v.tier]}`);
+/** Display a path relative to the project when possible. */
+function displayPath(abs: string, cwd: string): string {
+	const rel = relative(cwd, abs);
+	const p = rel && !rel.startsWith("..") && !isAbsolute(rel) ? rel : abs;
+	return p.replace(/\\/g, "/");
+}
+
+/** One-line danger banner: `Delete build/ recursively · .git · outside project`. */
+const REASON_TEXT: Record<string, string> = {
+	"privilege escalation": "elevated privileges",
+	"delete root": "wipes the filesystem root",
+	"raw disk operation": "raw disk access",
+	"remote script execution": "remote code execution",
+	"write to raw device": "raw device write",
+	"force push to main": "force push to main",
+};
+
+function dangerLine(action: string, v: Verdict): string {
+	const body = paint(TIER_COLOR[v.tier], action);
+	const rest = (v.reasons ?? []).map((r) => REASON_TEXT[r] ?? r);
+	return rest.length ? `${body}${paint(S_DIM, ` · ${rest.join(" · ")}`)}` : body;
+}
+
+// ---------- concrete bash descriptions ("Delete src/ recursively", ...) ----------
+
+function toolIndex(t: string[], verbs: string[]): number {
+	return t.findIndex((x) => verbs.includes(x.toLowerCase().replace(/\.exe$/, "")));
+}
+
+function argsOf(t: string[], start: number): string[] {
+	const out: string[] = [];
+	for (let i = start; i < t.length && out.length < 3; i++) {
+		const tok = t[i];
+		if (/^(&&|\|\||[|&;])$/.test(tok)) break; // next command begins
+		if (/^[-+]{1,2}[\w@]/.test(tok)) continue; // flag
+		if (/^[<>]{1,2}$/.test(tok)) {
+			i++; // skip the redirect target
+			continue;
+		}
+		out.push(tok);
+	}
+	return out;
+}
+
+/** Describe one command segment in plain English; undefined when generic. */
+function describeBashSeg(seg: string): string | undefined {
+	const t = seg.trim().split(/\s+/);
+	const at = (verbs: string[]) => toolIndex(t, verbs);
+	const args = (start: number) => argsOf(t, start);
+	const list = (a: string[]) => (a.length ? a.join(", ") : "the target");
+
+	let i = at(["rm"]);
+	if (i >= 0) {
+		const rec = /(^|\s)-{1,2}\S*r/i.test(seg) || /--recursive/.test(seg);
+		const force = /(^|\s)-{1,2}\S*f/i.test(seg) || /--force/.test(seg);
+		return `Delete ${list(args(i + 1))}${rec ? " recursively" : ""}${force ? " (force)" : ""}`;
+	}
+	i = at(["mv"]);
+	if (i >= 0) {
+		const a = args(i + 1);
+		return a.length >= 2 ? `Move ${a[0]} to ${a[1]}` : `Move ${list(a)}`;
+	}
+	i = at(["chmod", "chown"]);
+	if (i >= 0) return `Change permissions of ${list(args(i + 1))}`;
+	if (/git\s+reset\b/.test(seg))
+		return /--hard/.test(seg) ? "Discard all uncommitted changes (git reset --hard)" : "Rewrite git history (git reset)";
+	if (/git\s+clean\b/.test(seg)) return "Delete untracked files (git clean)";
+	if (/git\s+(checkout|restore)\b/.test(seg)) return "Discard working tree changes (git)";
+	i = at(["touch", "mkdir", "mktemp", "new-item"]);
+	if (i >= 0) return `Create ${list(args(i + 1))}`;
+	const redir = seg.match(/(?:>>?)\s*([^\s|&;<>]+)/);
+	if (/\b(tee|printf|echo|cat)\b/.test(seg) && redir) return `Write output to ${redir[1]}`;
+	const pkg = seg.match(/\b(npm|pnpm|yarn|bun|pip|pip3|apt|apt-get|brew|choco|winget|gem|cargo)\b/);
+	if (pkg && /\b(install|add|upgrade|update)\b/.test(seg)) return `Install packages with ${pkg[1]}`;
+	return undefined;
+}
+
+/** Describers keyed by DANGER_RULES label for the rules needing special text. */
+const DESCRIBERS: Record<string, (seg: string) => string> = {
+	"privilege escalation": (seg) =>
+		`Run with elevated privileges: ${describeBashSeg(seg.replace(/\b(sudo|doas)\s+/gi, "")) ?? "a command"}`,
+	"delete root": () => "Delete the filesystem root",
+	"raw disk operation": () => "Perform a low-level disk operation",
+	"remote script execution": () => "Download and run a remote script",
+	"write to raw device": () => "Write directly to a raw disk device",
+	"force push to main": () => "Force-push to the main branch",
+	"destructive git operation": (seg) => describeBashSeg(seg) ?? "Run a destructive git operation",
+	"force push": () => "Force-push to the remote",
+	"package publish": () => "Publish the package to the registry",
+	"git write operation": () => "Write to git history",
+};
+
+/** Concrete English description of the most dangerous part of a command. */
+function describeBash(command: string, verdict: Verdict): string {
+	if (verdict.tier === 4) return "Run a shell command";
+	const segs = [command, ...command.split(/\s*(?:&&|\|\||;|\n|\|)\s*/)].filter((s) => s.trim());
+	let best: { tier: Tier; text: string } | undefined;
+	for (const seg of segs) {
+		for (const rule of DANGER_RULES) {
+			if (!rule.re.test(seg)) continue;
+			if (best && best.tier <= rule.tier) continue;
+			const text = DESCRIBERS[rule.label]?.(seg.trim()) ?? describeBashSeg(seg.trim()) ?? rule.label;
+			if (!best || rule.tier < best.tier) best = { tier: rule.tier, text };
+		}
+	}
+	return best ? best.text : "Run a shell command";
 }
 
 function buildBashPrompt(command: string, verdict: Verdict): string {
 	const lines = [paint(S_HEADER, "Bash command")];
 	for (const l of clip(command, 6, 100)) lines.push(`  ${paint(S_TEXT, l)}`);
 	lines.push("");
-	lines.push(dangerLine(verdict));
+	lines.push(dangerLine(describeBash(command, verdict), verdict));
 	lines.push("");
 	lines.push(paint(S_WHITE, "Do you want to proceed?"));
 	return lines.join("\n");
@@ -576,15 +667,17 @@ interface EditInput {
 	newText?: string;
 }
 
-function buildEditPrompt(path: string, edits: EditInput[], abs: string, verdict: Verdict): string {
+function buildEditPrompt(path: string, edits: EditInput[], abs: string, cwd: string, verdict: Verdict): string {
 	const exists = existsSync(abs);
 	const hunks = edits.map((e) =>
 		buildHunk(e.oldText ?? "", e.newText ?? "", findStartLine(abs, e.oldText ?? "")),
 	);
 	const removed = hunks.reduce((n, h) => n + h.removed, 0);
 	const added = hunks.reduce((n, h) => n + h.added, 0);
+	const nEdits = `${hunks.length} edit${hunks.length === 1 ? "" : "s"}`;
+	const action = exists ? `Modify ${displayPath(abs, cwd)} (${nEdits})` : `Create ${displayPath(abs, cwd)} (${nEdits})`;
 
-	const lines = [toolHeader("Update", path), dangerLine(verdict), connector(summarize(removed, added))];
+	const lines = [toolHeader("Update", path), dangerLine(action, verdict), connector(summarize(removed, added))];
 	if (!exists) lines.push(`  ${paint(S_DIM, "(file does not exist, will be created)")}`);
 	for (const hunk of hunks) {
 		lines.push("");
@@ -595,11 +688,12 @@ function buildEditPrompt(path: string, edits: EditInput[], abs: string, verdict:
 	return lines.join("\n");
 }
 
-function buildWritePrompt(path: string, content: string, abs: string, verdict: Verdict): string {
+function buildWritePrompt(path: string, content: string, abs: string, cwd: string, verdict: Verdict): string {
 	const all = content.split("\n");
 	const exists = existsSync(abs);
 	const count = `${all.length} line${all.length === 1 ? "" : "s"}`;
 	const summary = exists ? `Overwrote the file with ${count}` : `Created a new file with ${count}`;
+	const action = exists ? `Overwrite ${displayPath(abs, cwd)} (${count})` : `Create ${displayPath(abs, cwd)} (${count})`;
 
 	const shown = all.slice(0, MAX_DIFF_LINES);
 	const rows: DiffRow[] = shown.map((text, i) => ({ ln: i + 1, sign: "+", text }));
@@ -607,7 +701,7 @@ function buildWritePrompt(path: string, content: string, abs: string, verdict: V
 		rows.push({ ln: null, sign: " ", text: `… ${all.length - shown.length} more lines` });
 	}
 
-	const lines = [toolHeader("Write", path), dangerLine(verdict), connector(summary), ""];
+	const lines = [toolHeader("Write", path), dangerLine(action, verdict), connector(summary), ""];
 	lines.push(...renderDiff(rows));
 	lines.push("");
 	lines.push(paint(S_WHITE, "Do you want to proceed?"));
@@ -615,7 +709,8 @@ function buildWritePrompt(path: string, content: string, abs: string, verdict: V
 }
 
 function buildToolPrompt(name: string, arg: string, verdict: Verdict): string {
-	return [toolHeader(name, arg), dangerLine(verdict), "", paint(S_WHITE, "Do you want to proceed?")].join("\n");
+	const action = verdict.tier === 4 ? `Call ${name} (read-only)` : `Call ${name}`;
+	return [toolHeader(name, arg), dangerLine(action, verdict), "", paint(S_WHITE, "Do you want to proceed?")].join("\n");
 }
 
 // ---------- diff helpers ----------
